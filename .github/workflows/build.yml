@@ -5,19 +5,224 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [17, 11]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.5
+          java-version: ${{ matrix.java }}
+      - name: Lay ma nguon thu vien AUSBC
+        run: git clone --depth 1 https://github.com/jiangdongguo/AndroidUSBCamera.git lib
+      - name: Ghep app DVR Plus vao
+        working-directory: lib
+        run: |
+          PKGATTR=""
+          if ! grep -q namespace app/build.gradle; then
+            PKGATTR=$(grep -o 'package="[^"]*"' app/src/main/AndroidManifest.xml | head -1)
+          fi
+          printf "\ninclude ':libausbc'\ninclude ':libuvc'\ninclude ':libnative'\n" >> settings.gradle
+          sed -i '/com\.github\.jiangdongguo/d' app/build.gradle
+          printf "\ndependencies {\n    implementation project(':libausbc')\n}\n" >> app/build.gradle
+          rm -rf app/src/main/*
+          mkdir -p app/src/main/java/com/dvrplus app/src/main/res/layout
+          cat > app/src/main/AndroidManifest.xml <<'EOF_M'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" PKGATTR_PLACEHOLDER>
+              <uses-feature android:name="android.hardware.usb.host" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <application android:label="DVR Plus" android:theme="@style/Theme.AppCompat.NoActionBar">
+                  <activity android:name="com.dvrplus.MainActivity" android:exported="true"
+                      android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+
+          EOF_M
+          sed -i "s#PKGATTR_PLACEHOLDER#$PKGATTR#" app/src/main/AndroidManifest.xml
+          cat > app/src/main/res/layout/activity_main.xml <<'EOF_L'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent" android:background="#000000">
+              <FrameLayout android:id="@+id/cameraContainer"
+                  android:layout_width="match_parent" android:layout_height="match_parent" />
+              <LinearLayout android:layout_width="wrap_content" android:layout_height="match_parent"
+                  android:layout_gravity="end" android:orientation="vertical" android:gravity="center"
+                  android:background="#66000000" android:padding="8dp">
+                  <Button android:id="@+id/btnRecord" android:layout_width="96dp" android:layout_height="wrap_content" android:text="Ghi" />
+                  <Button android:id="@+id/btnPhoto" android:layout_width="96dp" android:layout_height="wrap_content" android:text="Chụp" />
+                  <Button android:id="@+id/btnFlip" android:layout_width="96dp" android:layout_height="wrap_content" android:text="Lật" />
+                  <Button android:id="@+id/btnSettings" android:layout_width="96dp" android:layout_height="wrap_content" android:text="Chỉnh ảnh" />
+              </LinearLayout>
+              <LinearLayout android:id="@+id/panel" android:visibility="gone"
+                  android:layout_width="360dp" android:layout_height="wrap_content"
+                  android:layout_gravity="start|bottom" android:orientation="vertical"
+                  android:background="#B3000000" android:padding="12dp">
+                  <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="#FFFFFF" android:text="Độ sáng" />
+                  <SeekBar android:id="@+id/sbBrightness" android:layout_width="match_parent" android:layout_height="wrap_content" android:max="100" />
+                  <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="#FFFFFF" android:text="Tương phản" />
+                  <SeekBar android:id="@+id/sbContrast" android:layout_width="match_parent" android:layout_height="wrap_content" android:max="100" />
+                  <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="#FFFFFF" android:text="Bão hòa màu" />
+                  <SeekBar android:id="@+id/sbSaturation" android:layout_width="match_parent" android:layout_height="wrap_content" android:max="100" />
+                  <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="#FFFFFF" android:text="Gamma (tăng để sáng vùng tối)" />
+                  <SeekBar android:id="@+id/sbGamma" android:layout_width="match_parent" android:layout_height="wrap_content" android:max="100" />
+                  <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:textColor="#FFFFFF" android:text="Gain (giảm để bớt chói)" />
+                  <SeekBar android:id="@+id/sbGain" android:layout_width="match_parent" android:layout_height="wrap_content" android:max="100" />
+              </LinearLayout>
+          </FrameLayout>
+
+          EOF_L
+          cat > app/src/main/java/com/dvrplus/MainActivity.kt <<'EOF_K'
+          package com.dvrplus
+
+          import android.view.LayoutInflater
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.SeekBar
+          import android.widget.Toast
+          import com.jiangdg.ausbc.MultiCameraClient
+          import com.jiangdg.ausbc.base.CameraActivity
+          import com.jiangdg.ausbc.callback.ICameraStateCallBack
+          import com.jiangdg.ausbc.callback.ICaptureCallBack
+          import com.jiangdg.ausbc.camera.bean.CameraRequest
+          import com.jiangdg.ausbc.widget.AspectRatioTextureView
+          import com.jiangdg.ausbc.widget.IAspectRatio
+          import java.io.File
+
+          class MainActivity : CameraActivity() {
+
+              private lateinit var root: View
+              private val tv by lazy { AspectRatioTextureView(this) }
+              private val prefs by lazy { getSharedPreferences("dvrplus", MODE_PRIVATE) }
+              private var recording = false
+              private val keys = listOf("brightness", "contrast", "saturation", "gamma", "gain")
+              private val seekIds = listOf("sbBrightness", "sbContrast", "sbSaturation", "sbGamma", "sbGain")
+
+              private fun rid(name: String, type: String) = resources.getIdentifier(name, type, packageName)
+              private fun <T : View> v(name: String): T = root.findViewById(rid(name, "id"))
+
+              override fun getRootView(layoutInflater: LayoutInflater): View {
+                  root = layoutInflater.inflate(rid("activity_main", "layout"), null)
+                  return root
+              }
+
+              override fun getCameraView(): IAspectRatio = tv
+
+              override fun getCameraViewContainer(): ViewGroup = v("cameraContainer")
+
+              override fun getCameraRequest(): CameraRequest =
+                  CameraRequest.Builder()
+                      .setPreviewWidth(1280)
+                      .setPreviewHeight(720)
+                      .setRenderMode(CameraRequest.RenderMode.OPENGL)
+                      .setPreviewFormat(CameraRequest.PreviewFormat.FORMAT_MJPEG)
+                      .setAspectRatioShow(true)
+                      .create()
+
+              override fun initView() {
+                  super.initView()
+                  val panel = v<View>("panel")
+                  v<Button>("btnSettings").setOnClickListener {
+                      panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                  }
+                  v<Button>("btnFlip").setOnClickListener {
+                      prefs.edit().putBoolean("flip", !prefs.getBoolean("flip", false)).apply()
+                      applyFlip()
+                  }
+                  v<Button>("btnPhoto").setOnClickListener { takePhoto() }
+                  v<Button>("btnRecord").setOnClickListener { toggleRecord(it as Button) }
+                  seekIds.forEachIndexed { i, name ->
+                      val sb = v<SeekBar>(name)
+                      sb.progress = prefs.getInt(keys[i], 50)
+                      sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
+                              if (!fromUser) return
+                              prefs.edit().putInt(keys[i], p).apply()
+                              applyValue(keys[i], p)
+                          }
+                          override fun onStartTrackingTouch(s: SeekBar) {}
+                          override fun onStopTrackingTouch(s: SeekBar) {}
+                      })
+                  }
+                  applyFlip()
+              }
+
+              override fun onCameraState(
+                  self: MultiCameraClient.ICamera, code: ICameraStateCallBack.State, msg: String?
+              ) {
+                  if (code == ICameraStateCallBack.State.OPENED) {
+                      runOnUiThread {
+                          applyFlip()
+                          keys.forEach { k -> if (prefs.contains(k)) applyValue(k, prefs.getInt(k, 50)) }
+                      }
+                  }
+              }
+
+              private fun applyFlip() {
+                  tv.scaleX = if (prefs.getBoolean("flip", false)) -1f else 1f
+              }
+
+              // Gọi qua reflection để không phụ thuộc tên hàm chính xác của từng phiên bản thư viện
+              private fun applyValue(key: String, value: Int) {
+                  val cam: Any = getCurrentCamera() ?: return
+                  val name = "set" + key.replaceFirstChar { it.uppercase() }
+                  try {
+                      cam.javaClass.methods
+                          .firstOrNull { it.name == name && it.parameterTypes.size == 1 }
+                          ?.invoke(cam, value)
+                  } catch (e: Exception) {
+                      // camera không hỗ trợ thông số này
+                  }
+              }
+
+              private fun dir(sub: String): String {
+                  val d = File(getExternalFilesDir(null), "DVRPlus/$sub")
+                  d.mkdirs()
+                  return d.absolutePath
+              }
+
+              private fun takePhoto() {
+                  captureImage(object : ICaptureCallBack {
+                      override fun onBegin() {}
+                      override fun onError(error: String?) = toast("Lỗi chụp: $error")
+                      override fun onComplete(path: String?) = toast("Đã lưu: $path")
+                  }, "${dir("PHOTO")}/IMG_${System.currentTimeMillis()}.jpg")
+              }
+
+              private fun toggleRecord(btn: Button) {
+                  if (!recording) {
+                      captureVideoStart(object : ICaptureCallBack {
+                          override fun onBegin() { recording = true; runOnUiThread { btn.text = "Dừng" } }
+                          override fun onError(error: String?) { recording = false; toast("Lỗi ghi: $error") }
+                          override fun onComplete(path: String?) {
+                              recording = false
+                              runOnUiThread { btn.text = "Ghi" }
+                              toast("Đã lưu: $path")
+                          }
+                      }, "${dir("VIDEO")}/VID_${System.currentTimeMillis()}.mp4")
+                  } else captureVideoStop()
+              }
+
+              private fun toast(s: String) = runOnUiThread { Toast.makeText(this, s, Toast.LENGTH_SHORT).show() }
+          }
+
+          EOF_K
       - name: Build
-        working-directory: DVRPlus
-        run: gradle assembleDebug --no-daemon
+        working-directory: lib
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
       - uses: actions/upload-artifact@v4
         with:
-          name: DVRPlus-apk
-          path: DVRPlus/app/build/outputs/apk/debug/app-debug.apk
+          name: DVRPlus-apk-java${{ matrix.java }}
+          path: lib/app/build/outputs/apk/debug/*.apk
